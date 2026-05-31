@@ -1,4 +1,5 @@
 lightgbm
 numpy
+optuna
 pandas
 scikit-learn

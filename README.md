@@ -1,8 +1,206 @@
-# Kaggle PrayGround 202605
+# F1 Pit Stop Prediction: Kaggle Tabular ML Case Study
 
-LightGBM baseline for the F1 pit stop prediction competition.
+A tabular machine-learning project for predicting whether an F1 car will make
+a pit stop on the next lap. The solution evolved from a LightGBM baseline into
+a leakage-aware, multi-family ensemble of LightGBM and PyTorch models.
 
 Japanese experiment overview: [`EXPERIMENT_SUMMARY_0531.md`](EXPERIMENT_SUMMARY_0531.md)
+
+## Portfolio Summary
+
+### Problem
+
+The task is binary classification: estimate the probability that a car will
+pit on its next lap.
+
+```text
+Target: PitNextLap
+Competition train rows: 439,140
+External train rows:    101,371
+Test rows:              188,165
+```
+
+The underlying challenge is strongly tabular and context-dependent. Pit-stop
+decisions are influenced by race progress, tyre age, lap pace, degradation,
+track position, driver context, compound choice, and their interactions.
+
+### Metric
+
+The evaluation metric is ROC AUC. AUC measures ranking quality: a useful model
+should assign higher probabilities to positive rows than to negative rows.
+
+This affected the solution design in two ways:
+
+1. Submissions use probabilities rather than hard `0/1` decisions.
+2. The final search compares probability, rank-remap, and logit-probability
+   blends because differently calibrated models can still provide useful
+   ranking diversity.
+
+### Validation Strategy
+
+The project uses out-of-fold (OOF) predictions as the primary local evaluation
+signal.
+
+```text
+StratifiedKFold
+5 folds
+multiple random seeds for the strongest branches
+test predictions averaged across folds and seeds
+```
+
+Each competition training row receives a prediction only from a fold model
+that did not train on that row. This makes the OOF predictions suitable for
+honest model comparison and blend-weight search.
+
+Target encoding is fitted inside the fold pipeline. The advanced PyTorch
+branch uses an additional inner `StratifiedKFold` loop for weighted target
+encoding, preventing label leakage into validation rows.
+
+Public external data is incorporated with controlled weighting. The strongest
+LightGBM complement uses:
+
+```text
+external_weight = 0.65
+```
+
+### Feature Engineering
+
+The experiments combine raw race-state features with compact domain-inspired
+interactions.
+
+Representative numerical interactions:
+
+```text
+LapNumber / RaceProgress
+TyreLife / LapNumber
+LapTime * Cumulative_Degradation
+LapTime * abs(Cumulative_Degradation)
+LapTime / abs(Cumulative_Degradation)
+TyreLife * RaceProgress
+```
+
+Representative categorical features:
+
+```text
+Race + Compound
+Race + Year
+Compound + TyreLifeBand
+Compound + RaceProgressBand
+floored numeric categories
+quantile bins
+category counts
+fold-safe target encodings
+```
+
+Feature engineering was treated as an empirical question. Early broad feature
+expansion reduced Public score, so later iterations favored smaller,
+validated additions with clear domain meaning.
+
+### Models
+
+The final solution combines three model families.
+
+| Family | Role | Key implementation details |
+|---|---|---|
+| LightGBM | Fast tabular baseline and complementary tree model | External-data weighting, categorical handling, regularization search, blend-oriented candidate selection |
+| RealMLP-inspired PyTorch | Strong standalone anchor | PBLD numerical embeddings, categorical one-hot/embeddings, residual blocks, parameter-group-specific optimization, `16` internal ensemble members |
+| Standard embedding PyTorch MLP | Diversity branch | Categorical embeddings, residual MLP blocks, weighted BCE loss, AMP, early stopping, optional multi-GPU `DataParallel` |
+
+The strongest standalone anchor is the 19th RealMLP run:
+
+```text
+3 seeds x 5 folds x 16 internal ensemble members
+OOF AUC: 0.954228
+```
+
+### CV vs Public LB
+
+OOF AUC was useful for direction-setting, but small OOF differences did not
+always transfer directly to the leaderboard.
+
+| Experiment | OOF AUC | Public LB | Observation |
+|---|---:|---:|---|
+| 7th external-data LightGBM | `0.946474` | `0.94572` | Stronger baseline after adding weighted external data |
+| 10th LightGBM + PyTorch blend | `0.947876` | `0.94743` | Diversity improved ranking quality |
+| 13th three-model blend | `0.950058` | `0.94916` | Multi-family blending continued to help |
+| 17th RealMLP reference | `0.953732` | `0.95368` | Major standalone improvement |
+| 16th RealMLP-anchor blend | `0.954127` | `0.95375` | Complementary models improved the anchor |
+| 22nd selected probability blend | `0.954707` | `0.95392` | Best final Public candidate |
+| 22nd selected logit blend | `0.954648` | `0.95392` | Simpler fallback matched the best Public score |
+| 22nd blend with recovered 21st model | `0.954684` | `0.95389` | Slight OOF improvement over the fallback did not improve Public LB |
+
+Final leaderboard result:
+
+```text
+Private score: 0.95433
+Final rank:    508
+```
+
+### Error Analysis
+
+Hidden-test labels are unavailable, so error analysis was performed through
+controlled ablations, OOF diagnostics, fold stability, and leaderboard
+behavior.
+
+Key findings:
+
+1. Broad feature expansion can hurt. The 2nd and 3rd LightGBM experiments
+   scored below the raw baseline, motivating smaller validated feature sets.
+2. External data helps when its influence is controlled. A weight of `0.65`
+   improved the LightGBM branch while acknowledging distribution differences.
+3. Identity features are not automatically beneficial. The selected 20th
+   LightGBM complement was `no_driver_ext65`, suggesting that removing
+   potentially unstable driver identity information improved generalization
+   or complementarity.
+4. Tiny OOF gains require skepticism. Adding the recovered 21st PyTorch branch
+   produced a plausible OOF blend but slightly reduced Public score from
+   `0.95392` to `0.95389`.
+5. Fold and neighborhood diagnostics matter. Final blend candidates were
+   evaluated not only at their best weight but also under nearby weight
+   perturbations to avoid brittle OOF optima.
+
+### Final Ensemble
+
+Two deliberately different final candidates were selected.
+
+Primary probability blend:
+
+```text
+55% 19th RealMLP
+20% 20th LightGBM
+19% 18th RealMLP
+ 6% 15th PyTorch
+
+OOF AUC:   0.954707
+Public LB: 0.95392
+```
+
+Simpler logit-probability fallback:
+
+```text
+73% 19th RealMLP
+27% 20th LightGBM
+
+OOF AUC:   0.954648
+Public LB: 0.95392
+```
+
+The two submissions matched on the Public leaderboard while preserving
+meaningful structural diversity for the private evaluation.
+
+### Key Learnings
+
+1. Build a trustworthy OOF pipeline before tuning aggressively.
+2. Treat target encoding as a leakage-sensitive operation and fit it inside
+   validation folds.
+3. Evaluate ensemble members by complementarity, not standalone AUC alone.
+4. Keep high-performing tabular models from different families: trees and
+   neural networks often rank difficult rows differently.
+5. Use ablations to remove unstable features instead of assuming that more
+   features are always better.
+6. Compare probability, rank, and logit blends when optimizing an AUC metric.
+7. Prefer stable neighborhoods over a single sharp blend optimum.
+8. Archive Kaggle artifacts immediately: `/kaggle/working` is ephemeral.
 
 ## Results
 
@@ -46,7 +244,7 @@ public leaderboard. The final private score improved to `0.95433`.
 | 18th | `18th_0531_gpu_realmlp_seed_ensemble.py` | Not submitted | Three-seed stabilization of the 17th RealMLP. OOF AUC: `0.954225`. |
 | 19th | `19th_0531_gpu_realmlp_6epoch_seed_ensemble.py` | Not submitted | Six-epoch RealMLP follow-up. OOF AUC: `0.954228`, effectively tied with 18th but selected as the final anchor. |
 | 20th | `20th_0531_blend_optimized_lightgbm.py` | Not submitted | Selected `no_driver_ext65`: standalone OOF `0.951581`; `76%` 18th RealMLP + `24%` 20th LightGBM reaches OOF `0.954571`. |
-| 21st | `21st_0531_gpu_pytorch_residual_complement.py` | Not submitted | First completed run reached OOF `0.950422`, but its Kaggle working-directory artifacts were lost after the session ended. A recovery rerun is pending. |
+| 21st | `21st_0531_gpu_pytorch_residual_complement.py` | Not submitted | OOF `0.950422`. The first Kaggle artifacts were lost after the session ended, then recovered through a rerun and tested in the final blend search. |
 | 22nd | `22nd_0531_final_oof_blend_search.py` | `0.95392` | Final selected candidates. Best probability blend OOF: `0.954707` from `55%` 19th + `20%` 20th + `19%` 18th + `6%` 15th. The simpler `73%` 19th + `27%` 20th logit blend also scored `0.95392` Public. Final private score: `0.95433`; rank: `508`. |
 
 ## Files
